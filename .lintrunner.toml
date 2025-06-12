@@ -90,6 +90,7 @@ include_patterns = [
     'torch/headeronly/**/*.h',
     'test/cpp/**/*.h',
     'test/cpp/**/*.cpp',
+    'aten/src/ATen/native/zendnn/*.*'
 ]
 exclude_patterns = [
     'aten/src/ATen/native/vulkan/api/vk_mem_alloc.h',
