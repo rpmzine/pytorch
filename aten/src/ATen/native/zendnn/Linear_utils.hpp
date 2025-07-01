@@ -5,6 +5,7 @@
 #include <iostream>
 #include <optional> // For std::optional, std::nullopt
 #include <string>
+#include <c10/util/Logging.h>
 #if AT_ZENDNN_ENABLED()
 #include <zendnnl.hpp>
 namespace at::native {
