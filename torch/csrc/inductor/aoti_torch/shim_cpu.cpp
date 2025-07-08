@@ -533,6 +533,7 @@ AOTITorchError aoti_torch_cpu__zendnn_linear(
     AtenTensorHandle W,
     AtenTensorHandle* B,
     bool is_weight_prepacked,
+    const char* post_op,
     const char* name,
     AtenTensorHandle* ret0) {
   AOTI_TORCH_CONVERT_EXCEPTION_TO_ERROR_CODE({
@@ -542,6 +543,7 @@ AOTITorchError aoti_torch_cpu__zendnn_linear(
         *tensor_handle_to_tensor_pointer(W),
         pointer_to_optional<at::Tensor>(B),
         is_weight_prepacked,
+        std::string(post_op),
         std::string(name));
     *ret0 = new_tensor_handle(std::move(tmp_result));
   });
@@ -557,8 +559,8 @@ AOTITorchError aoti_torch_cpu__zendnn_weight_prepack_for_linear(
         *tensor_handle_to_tensor_pointer(W),
         treat_tensor_as_transposed,
         std::string(name));
-     *ret0 = new_tensor_handle(std::move(tmp_result));
-   });
+    *ret0 = new_tensor_handle(std::move(tmp_result));
+  });
 }
 
 #endif // AT_ZENDNN_ENABLED()
