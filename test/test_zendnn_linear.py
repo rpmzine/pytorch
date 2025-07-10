@@ -1,10 +1,13 @@
 # Owner(s): ["module: unknown"]
+import copy
 import unittest
 
 from hypothesis import given, settings, strategies as st
 
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
+from torch._inductor.fx_passes.zendnn_utils import counters
 from torch.testing._internal.common_utils import run_tests, TestCase
 
 
@@ -226,6 +229,161 @@ class TestZenDNNLinear(TestCase):
         result = torch.ops.aten.zendnn_linear(input, weight, bias)
 
         torch.testing.assert_close(result, expected, rtol=1e-2, atol=1e-2)
+
+
+class CustomLinearModel(nn.Module):
+    def __init__(self, weight, bias):
+        super(__class__, self).__init__()
+        self.linear = nn.Linear(weight.size(1), weight.size(0), bias is not None)
+        self.linear.weight.data = weight.clone()
+        if bias is not None:
+            self.linear.bias.data = bias.clone()
+
+    def forward(self, input):
+        return self.linear(input)
+
+
+class TestCompiledLinear(TestCase):
+    def setUp(self):
+        self.device = torch.device("cpu")
+        self.previous_freezing = torch._inductor.config.freezing
+        torch._inductor.config.freezing = True
+        # Check if bfloat16 is supported on the current device
+        self.bf16_supported = torch._C._cpu._is_avx512_bf16_supported()
+
+    def tearDown(self):
+        torch._inductor.config.freezing = self.previous_freezing
+
+    def _test_compiled_linear(self, input, weight, bias, atol, rtol, freezing):
+        # Create a linear model
+        torch._dynamo.reset()
+        linear_model = CustomLinearModel(weight, bias)
+        # Create compiled version
+        compiled_model = torch.compile(copy.deepcopy(linear_model), backend="inductor")
+
+        # Forward pass with both models
+        counters.clear()
+        with torch.no_grad():
+            expected = linear_model(input)
+            self.assertEqual(counters["zendnn"]["zendnn_linear"], 0)
+            self.assertEqual(counters["zendnn"]["zendnn_weight_prepack_for_linear"], 0)
+            result = compiled_model(input)
+            self.assertEqual(counters["zendnn"]["zendnn_linear"], 1)
+            self.assertEqual(counters["zendnn"]["zendnn_weight_prepack_for_linear"], 1)
+        # Compare results
+        torch.testing.assert_close(result, expected, rtol=rtol, atol=atol)
+
+    @given(
+        batch_size=st.integers(1, 32),
+        in_features=st.integers(2, 256),
+        out_features=st.integers(2, 256),
+        has_bias=st.booleans(),
+        use_bf16=st.booleans(),
+    )
+    @settings(deadline=None)
+    def test_compiled_linear_2d_input(
+        self, batch_size, in_features, out_features, has_bias, use_bf16
+    ):
+        freezing = True  # Set to True to test freezing behavior
+        if use_bf16 and not self.bf16_supported:
+            # Skip test if bf16 is requested but not supported
+            self.skipTest("BFloat16 not supported on this device")
+        dtype = torch.bfloat16 if use_bf16 else torch.float32
+
+        # Create input tensor
+        input = torch.randn(batch_size, in_features, device=self.device, dtype=dtype)
+
+        # Create weight tensor
+        weight = torch.randn(out_features, in_features, device=self.device, dtype=dtype)
+        # print(input)
+        # print(weight)
+
+        # Create bias tensor (optional)
+        bias = (
+            torch.randn(out_features, device=self.device, dtype=dtype)
+            if has_bias
+            else None
+        )
+        rtol = 1e-2 if use_bf16 else 1e-4  # Relax tolerances for BF16
+        atol = 1e-2 if use_bf16 else 1e-4
+        self._test_compiled_linear(input, weight, bias, atol, rtol, freezing)
+
+    @given(
+        batch_size=st.integers(1, 16),
+        seq_len=st.integers(1, 32),
+        in_features=st.integers(2, 128),
+        out_features=st.integers(2, 128),
+        has_bias=st.booleans(),
+        use_bf16=st.booleans(),
+    )
+    @settings(deadline=None)
+    def test_compiled_linear_3d_input(
+        self, batch_size, seq_len, in_features, out_features, has_bias, use_bf16
+    ):
+        freezing = True  # Set to True to test freezing behavior
+        if use_bf16 and not self.bf16_supported:
+            # Skip test if bf16 is requested but not supported
+            self.skipTest("BFloat16 not supported on this device")
+
+        dtype = torch.bfloat16 if use_bf16 else torch.float32
+
+        # Create input tensor
+        input = torch.randn(
+            batch_size, seq_len, in_features, device=self.device, dtype=dtype
+        )
+
+        # Create weight tensor
+        weight = torch.randn(out_features, in_features, device=self.device, dtype=dtype)
+
+        # Create bias tensor (optional)
+        bias = (
+            torch.randn(out_features, device=self.device, dtype=dtype)
+            if has_bias
+            else None
+        )
+
+        rtol = 1e-2 if use_bf16 else 1e-4  # Relax tolerances for BF16
+        atol = 1e-2 if use_bf16 else 1e-4
+        self._test_compiled_linear(input, weight, bias, atol, rtol, freezing)
+
+    @given(
+        dims=st.integers(4, 5),
+        batch_dim=st.integers(1, 8),
+        in_features=st.integers(2, 64),
+        out_features=st.integers(2, 64),
+        has_bias=st.booleans(),
+        use_bf16=st.booleans(),
+    )
+    @settings(deadline=None)
+    def test_compiled_linear_nd_input(
+        self, dims, batch_dim, in_features, out_features, has_bias, use_bf16
+    ):
+        freezing = True  # Set to True to test freezing behavior
+        if use_bf16 and not self.bf16_supported:
+            # Skip test if bf16 is requested but not supported
+            self.skipTest("BFloat16 not supported on this device")
+
+        dtype = torch.bfloat16 if use_bf16 else torch.float32
+
+        # Create shape with multiple batch dimensions
+        shape = [batch_dim] * (dims - 1) + [in_features]
+
+        # Create input tensor
+        input = torch.randn(*shape, device=self.device, dtype=dtype)
+
+        # Create weight tensor
+        weight = torch.randn(out_features, in_features, device=self.device, dtype=dtype)
+
+        # Create bias tensor (optional)
+        bias = (
+            torch.randn(out_features, device=self.device, dtype=dtype)
+            if has_bias
+            else None
+        )
+
+        rtol = 1e-2 if use_bf16 else 1e-4  # Relax tolerances for BF16
+        atol = 1e-2 if use_bf16 else 1e-4
+        self._test_compiled_linear(input, weight, bias, atol, rtol, freezing)
 
 
 if __name__ == "__main__":
