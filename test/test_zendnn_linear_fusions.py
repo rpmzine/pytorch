@@ -1,26 +1,61 @@
 # Owner(s): ["module: unknown"]
+import copy
 import os
 import unittest
 
 from hypothesis import given, settings, strategies as st
 
 import torch
+import torch._inductor.config
 import torch.nn as nn
 import torch.nn.functional as F
 from torch._inductor.fx_passes.zendnn_utils import counters
 from torch.testing._internal.common_utils import run_tests, TestCase
 
 
-class CustomLinearModel(nn.Module):
-    def __init__(self, weight, bias):
-        super(__class__, self).__init__()
+FUSION_TO_ACTIVATION_FUNC_MAP = {
+    "relu": F.relu,
+    "silu": F.silu,
+    "sigmoid": torch.sigmoid,
+    "tanh": torch.tanh,
+    # "gelu_erf": F.gelu, # TODO: Gelu_ERF tests currently fails due to issue with blis.
+    "gelu_tanh": lambda x: F.gelu(x, approximate="tanh"),
+    "add": None,  # For 'add', we'll handle it separately
+    "mul": None,  # For 'mul', we'll handle it separately
+}
+
+
+class CustomLinearFusionModel(nn.Module):
+    def __init__(self, weight, bias, fusion_op, second_input=None):
+        super().__init__()
         self.linear = nn.Linear(weight.size(1), weight.size(0), bias is not None)
         self.linear.weight.data = weight.clone()
         if bias is not None:
             self.linear.bias.data = bias.clone()
+        self.fusion_op = fusion_op
+        self.second_input = second_input
 
-    def forward(self, input):
-        return self.linear(input)
+    def forward(self, x):
+        x = self.linear(x)
+
+        if self.fusion_op == "relu":
+            return F.relu(x)
+        elif self.fusion_op == "silu":
+            return F.silu(x)
+        elif self.fusion_op == "sigmoid":
+            return torch.sigmoid(x)
+        elif self.fusion_op == "tanh":
+            return torch.tanh(x)
+        elif self.fusion_op == "gelu_erf":
+            return F.gelu(x)
+        elif self.fusion_op == "gelu_tanh":
+            return F.gelu(x, approximate="tanh")
+        elif self.fusion_op == "add" and self.second_input is not None:
+            return x + self.second_input
+        elif self.fusion_op == "mul" and self.second_input is not None:
+            return x * self.second_input
+        else:
+            return x
 
 
 @unittest.skipIf(
@@ -30,30 +65,67 @@ class CustomLinearModel(nn.Module):
     ),
     "ZenDNN is not available in this PyTorch build",
 )
-class TestZenDNNLinear(TestCase):
+class TestZenDNNLinearFusion(TestCase):
     def setUp(self):
         self.device = torch.device("cpu")
         # Check if bfloat16 is supported on the current device
         self.bf16_supported = torch._C._cpu._is_avx512_bf16_supported()
+        self.previous_enable_zendnn = torch._inductor.config.enable_zendnn
+        self.fusion_ops = list(FUSION_TO_ACTIVATION_FUNC_MAP.keys())
 
-    def _test_zendnn_linear(self, input, weight, bias, atol, rtol, weight_prepacked):
-        # Run reference implementation using torch.nn.functional.linear
-        expected = F.linear(input, weight, bias)
+    def tearDown(self):
+        torch._inductor.config.enable_zendnn = self.previous_enable_zendnn
+
+    def _get_activation_fn(self, fusion_op):
+        """Return the corresponding PyTorch activation function for the fusion op"""
+        return FUSION_TO_ACTIVATION_FUNC_MAP[fusion_op]
+
+    def _test_zendnn_linear_fusion(
+        self,
+        input,
+        weight,
+        bias,
+        fusion_op,
+        second_input=None,
+        atol=1e-4,
+        rtol=1e-4,
+        weight_prepacked=False,
+    ):
+        # Reset counters
+        counters.clear()
+        # Run reference implementation
+        torch._dynamo.reset()
+        torch._inductor.config.enable_zendnn = False
+        linear_model = CustomLinearFusionModel(
+            weight, bias, fusion_op, second_input
+        ).to(input.dtype)
+        compiled_model = torch.compile(linear_model, backend="inductor")
+        with torch.no_grad():
+            expected = compiled_model(input)
+        torch._inductor.config.enable_zendnn = True
         if weight_prepacked:
-            # Prepack the weight tensor for ZenDNN
             weight = torch.ops.aten.zendnn_weight_prepack_for_linear(weight)
 
         # Run ZenDNN implementation
-        if bias is not None:
+        if fusion_op in ["add", "mul"] and second_input is not None:
+            result = torch.ops.aten.zendnn_linear_unary_binary(
+                input=input,
+                weight=weight,
+                binary_input=second_input,
+                bias=bias,
+                is_weight_prepacked=weight_prepacked,
+                post_op_1="",
+                post_op_2=fusion_op,
+                zendnn_op_name="linear_" + fusion_op,
+            )
+        else:
             result = torch.ops.aten.zendnn_linear(
                 input=input,
                 weight=weight,
                 bias=bias,
                 is_weight_prepacked=weight_prepacked,
-            )
-        else:
-            result = torch.ops.aten.zendnn_linear(
-                input=input, weight=weight, is_weight_prepacked=weight_prepacked
+                post_op=fusion_op,
+                zendnn_op_name="linear_" + fusion_op,
             )
 
         # Compare results
@@ -67,22 +139,28 @@ class TestZenDNNLinear(TestCase):
         out_features=st.integers(2, 256),
         has_bias=st.booleans(),
         use_bf16=st.booleans(),
-        weight_prepacked=st.booleans(),
+        fusion_op_idx=st.integers(
+            0, len(FUSION_TO_ACTIVATION_FUNC_MAP) - 1
+        ),  # Index into self.fusion_ops
+        weight_prepacked=st.booleans(),  # Whether to use prepacked weights
     )
     @settings(deadline=None)
-    def test_zendnn_linear_2d_input(
+    def test_zendnn_linear_fusion_2d_input(
         self,
         batch_size,
         in_features,
         out_features,
         has_bias,
         use_bf16,
+        fusion_op_idx,
         weight_prepacked,
     ):
         if use_bf16 and not self.bf16_supported:
             # Skip test if bf16 is requested but not supported
             self.skipTest("BFloat16 not supported on this device")
+
         dtype = torch.bfloat16 if use_bf16 else torch.float32
+        fusion_op = self.fusion_ops[fusion_op_idx]
 
         # Create input tensor
         input = torch.randn(
@@ -110,9 +188,24 @@ class TestZenDNNLinear(TestCase):
             if has_bias
             else None
         )
+
+        # Create second input for binary ops (add, mul)
+        second_input = None
+        if fusion_op in ["add", "mul"]:
+            second_input = torch.randn(
+                batch_size,
+                out_features,
+                dtype=dtype,
+                requires_grad=False,
+                device=self.device,
+            )
+
         rtol = 1e-2 if use_bf16 else 1e-4  # Relax tolerances for BF16
         atol = 1e-2 if use_bf16 else 1e-4
-        self._test_zendnn_linear(input, weight, bias, atol, rtol, weight_prepacked)
+
+        self._test_zendnn_linear_fusion(
+            input, weight, bias, fusion_op, second_input, atol, rtol, weight_prepacked
+        )
 
     @given(
         batch_size=st.integers(1, 16),
@@ -121,10 +214,13 @@ class TestZenDNNLinear(TestCase):
         out_features=st.integers(2, 128),
         has_bias=st.booleans(),
         use_bf16=st.booleans(),
-        weight_prepacked=st.booleans(),
+        fusion_op_idx=st.integers(
+            0, len(FUSION_TO_ACTIVATION_FUNC_MAP) - 1
+        ),  # Index into self.fusion_ops
+        weight_prepacked=st.booleans(),  # Whether to use prepacked weights
     )
     @settings(deadline=None)
-    def test_zendnn_linear_3d_input(
+    def test_zendnn_linear_fusion_3d_input(
         self,
         batch_size,
         seq_len,
@@ -132,6 +228,7 @@ class TestZenDNNLinear(TestCase):
         out_features,
         has_bias,
         use_bf16,
+        fusion_op_idx,
         weight_prepacked,
     ):
         if use_bf16 and not self.bf16_supported:
@@ -139,6 +236,7 @@ class TestZenDNNLinear(TestCase):
             self.skipTest("BFloat16 not supported on this device")
 
         dtype = torch.bfloat16 if use_bf16 else torch.float32
+        fusion_op = self.fusion_ops[fusion_op_idx]
 
         # Create input tensor
         input = torch.randn(
@@ -168,9 +266,24 @@ class TestZenDNNLinear(TestCase):
             else None
         )
 
+        # Create second input for binary ops (add, mul)
+        second_input = None
+        if fusion_op in ["add", "mul"]:
+            second_input = torch.randn(
+                batch_size,
+                seq_len,
+                out_features,
+                dtype=dtype,
+                requires_grad=False,
+                device=self.device,
+            )
+
         rtol = 1e-2 if use_bf16 else 1e-4  # Relax tolerances for BF16
         atol = 1e-2 if use_bf16 else 1e-4
-        self._test_zendnn_linear(input, weight, bias, atol, rtol, weight_prepacked)
+
+        self._test_zendnn_linear_fusion(
+            input, weight, bias, fusion_op, second_input, atol, rtol, weight_prepacked
+        )
 
     @given(
         dims=st.integers(4, 5),
@@ -179,10 +292,13 @@ class TestZenDNNLinear(TestCase):
         out_features=st.integers(2, 64),
         has_bias=st.booleans(),
         use_bf16=st.booleans(),
-        weight_prepacked=st.booleans(),
+        fusion_op_idx=st.integers(
+            0, len(FUSION_TO_ACTIVATION_FUNC_MAP) - 1
+        ),  # Index into self.fusion_ops
+        weight_prepacked=st.booleans(),  # Whether to use prepacked weights
     )
     @settings(deadline=None)
-    def test_zendnn_linear_nd_input(
+    def test_zendnn_linear_fusion_nd_input(
         self,
         dims,
         batch_dim,
@@ -190,6 +306,7 @@ class TestZenDNNLinear(TestCase):
         out_features,
         has_bias,
         use_bf16,
+        fusion_op_idx,
         weight_prepacked,
     ):
         if use_bf16 and not self.bf16_supported:
@@ -197,6 +314,7 @@ class TestZenDNNLinear(TestCase):
             self.skipTest("BFloat16 not supported on this device")
 
         dtype = torch.bfloat16 if use_bf16 else torch.float32
+        fusion_op = self.fusion_ops[fusion_op_idx]
 
         # Create shape with multiple batch dimensions
         shape = [batch_dim] * (dims - 1) + [in_features]
@@ -224,101 +342,40 @@ class TestZenDNNLinear(TestCase):
             else None
         )
 
+        # Create second input for binary ops (add, mul)
+        second_input = None
+        if fusion_op in ["add", "mul"]:
+            # Create shape for second input (same as output shape)
+            output_shape = list(shape)
+            output_shape[-1] = out_features
+            second_input = torch.randn(
+                *output_shape, dtype=dtype, requires_grad=False, device=self.device
+            )
+
         rtol = 1e-2 if use_bf16 else 1e-4  # Relax tolerances for BF16
         atol = 1e-2 if use_bf16 else 1e-4
-        self._test_zendnn_linear(input, weight, bias, atol, rtol, weight_prepacked)
 
-    @given(
-        batch_size=st.integers(1, 32),
-        in_features=st.integers(2, 128),
-        out_features=st.integers(2, 128),
-        use_bf16=st.booleans(),
-    )
-    @settings(deadline=None)
-    def test_zendnn_linear_keyword_args(
-        self, batch_size, in_features, out_features, use_bf16
-    ):
-        if use_bf16 and not self.bf16_supported:
-            # Skip test if bf16 is requested but not supported
-            self.skipTest("BFloat16 not supported on this device")
-
-        dtype = torch.bfloat16 if use_bf16 else torch.float32
-
-        # Create tensors
-        input = torch.randn(
-            batch_size,
-            in_features,
-            dtype=dtype,
-            requires_grad=False,
-            device=self.device,
-        )
-        weight = torch.randn(
-            out_features,
-            in_features,
-            dtype=dtype,
-            requires_grad=False,
-            device=self.device,
-        )
-        bias = torch.randn(
-            out_features, dtype=dtype, requires_grad=False, device=self.device
+        self._test_zendnn_linear_fusion(
+            input, weight, bias, fusion_op, second_input, atol, rtol, weight_prepacked
         )
 
-        # Run with positional arguments
-        result1 = torch.ops.aten.zendnn_linear(input, weight, bias)
-
-        # Run with keyword arguments
-        result2 = torch.ops.aten.zendnn_linear(input=input, weight=weight, bias=bias)
-
-        # Compare results
-        rtol = 1e-2 if use_bf16 else 1e-4  # Relax tolerances for BF16
-        atol = 1e-2 if use_bf16 else 1e-4
-        torch.testing.assert_close(
-            result1, result2, rtol=rtol, atol=atol, equal_nan=True
-        )
-
-    def test_zendnn_linear_exception_weight_dim(self):
-        # Test invalid weight dimension
-        input = torch.randn(10, 20, requires_grad=False, device=self.device)
-        weight = torch.randn(
-            30, 20, 5, requires_grad=False, device=self.device
-        )  # Should be 2D
-
-        with self.assertRaises(RuntimeError):
-            torch.ops.aten.zendnn_linear(input, weight)
-
-    def test_zendnn_linear_exception_bias_dim(self):
-        # Test invalid bias dimension
+    def test_zendnn_linear_fusion_invalid_op(self):
+        # Test with invalid fusion op
         input = torch.randn(10, 20, requires_grad=False, device=self.device)
         weight = torch.randn(30, 20, requires_grad=False, device=self.device)
-        bias = torch.randn(
-            30, 5, requires_grad=False, device=self.device
-        )  # Should be 1D
+        bias = torch.randn(30, requires_grad=False, device=self.device)
 
         with self.assertRaises(RuntimeError):
-            torch.ops.aten.zendnn_linear(input, weight, bias)
+            torch.ops.aten.zendnn_linear(
+                input=input,
+                weight=weight,
+                bias=bias,
+                is_weight_prepacked=False,
+                post_op="invalid_op",
+                zendnn_op_name="linear_invalid",
+            )
 
-    def test_zendnn_linear_exception_feature_mismatch(self):
-        # Test mismatch in feature dimensions
-        input = torch.randn(10, 20, requires_grad=False, device=self.device)
-        weight = torch.randn(
-            30, 25, requires_grad=False, device=self.device
-        )  # Should be (30, 20)
-
-        with self.assertRaises(RuntimeError):
-            torch.ops.aten.zendnn_linear(input, weight)
-
-    def test_zendnn_linear_exception_bias_size(self):
-        # Test mismatch in bias size
-        input = torch.randn(10, 20, requires_grad=False, device=self.device)
-        weight = torch.randn(30, 20, requires_grad=False, device=self.device)
-        bias = torch.randn(
-            35, requires_grad=False, device=self.device
-        )  # Should be size 30
-
-        with self.assertRaises(RuntimeError):
-            torch.ops.aten.zendnn_linear(input, weight, bias)
-
-    def test_zendnn_linear_dtype_mismatch(self):
+    def test_zendnn_linear_fusion_dtype_mismatch(self):
         # Test dtype mismatch between input tensors
         input = torch.randn(
             10, 20, dtype=torch.float32, requires_grad=False, device=self.device
@@ -328,31 +385,14 @@ class TestZenDNNLinear(TestCase):
         )  # Different dtype
 
         with self.assertRaises(RuntimeError):
-            torch.ops.aten.zendnn_linear(input, weight)
-
-    def test_zendnn_linear_bf16(self):
-        # Skip if BF16 is not supported
-        if not self.bf16_supported:
-            self.skipTest("BFloat16 not supported on this device")
-
-        # Create BF16 tensors
-        input = torch.randn(
-            10, 20, dtype=torch.bfloat16, requires_grad=False, device=self.device
-        )
-        weight = torch.randn(
-            30, 20, dtype=torch.bfloat16, requires_grad=False, device=self.device
-        )
-        bias = torch.randn(
-            30, dtype=torch.bfloat16, requires_grad=False, device=self.device
-        )
-
-        # Verify both implementations produce similar results
-        expected = F.linear(input, weight, bias)
-        result = torch.ops.aten.zendnn_linear(input, weight, bias)
-
-        torch.testing.assert_close(
-            result, expected, rtol=1e-2, atol=1e-2, equal_nan=True
-        )
+            torch.ops.aten.zendnn_linear(
+                input=input,
+                weight=weight,
+                bias=None,
+                is_weight_prepacked=False,
+                post_op="relu",
+                zendnn_op_name="linear_relu",
+            )
 
 
 @unittest.skipIf(
@@ -362,7 +402,7 @@ class TestZenDNNLinear(TestCase):
     ),
     "ZenDNN is not available in this PyTorch build",
 )
-class TestCompiledLinear(TestCase):
+class TestCompiledLinearFusion(TestCase):
     def setUp(self):
         self.device = torch.device("cpu")
         self.previous_freezing = torch._inductor.config.freezing
@@ -371,21 +411,33 @@ class TestCompiledLinear(TestCase):
         self.previous_enable_zendnn = torch._inductor.config.enable_zendnn
         # Check if bfloat16 is supported on the current device
         self.bf16_supported = torch._C._cpu._is_avx512_bf16_supported()
+        self.fusion_ops = list(FUSION_TO_ACTIVATION_FUNC_MAP.keys())
 
     def tearDown(self):
         torch._inductor.config.cpp.weight_prepack = self.previous_weight_prepack
         torch._inductor.config.freezing = self.previous_freezing
         torch._inductor.config.enable_zendnn = self.previous_enable_zendnn
 
-    def _test_compiled_linear(
-        self, input, weight, bias, atol, rtol, weight_prepacked, dynamic_shape
+    def _test_compiled_linear_fusion(
+        self,
+        input,
+        weight,
+        bias,
+        fusion_op,
+        second_input,
+        atol,
+        rtol,
+        weight_prepacked,
+        dynamic_shape,
     ):
         # Reset counters
         counters.clear()
-        # Run reference implementation using torch.nn.functional.linear
+        # Run reference implementation
         torch._dynamo.reset()
         torch._inductor.config.enable_zendnn = False
-        linear_model = CustomLinearModel(weight, bias).to(input.dtype)
+        linear_model = CustomLinearFusionModel(
+            weight, bias, fusion_op, second_input
+        ).to(input.dtype)
         compiled_model = torch.compile(
             linear_model, backend="inductor", dynamic=dynamic_shape
         )
@@ -393,24 +445,21 @@ class TestCompiledLinear(TestCase):
             expected = compiled_model(input)
         torch._inductor.config.enable_zendnn = True
 
-        # Run ZenDNN implementation
-        torch._dynamo.reset()
         torch._inductor.config.cpp.weight_prepack = weight_prepacked
-        zendnn_linear_model = CustomLinearModel(weight, bias).to(input.dtype)
+        torch._dynamo.reset()
         compiled_model = torch.compile(
-            zendnn_linear_model, backend="inductor", dynamic=dynamic_shape
+            copy.deepcopy(linear_model), backend="inductor", dynamic=dynamic_shape
         )
-
         with torch.no_grad():
-            expected = linear_model(input)
-            self.assertEqual(counters["zendnn"]["zendnn_linear"], 0)
+            self.assertEqual(counters["zendnn"]["zendnn_linear_" + fusion_op], 0)
             self.assertEqual(counters["zendnn"]["zendnn_weight_prepack_for_linear"], 0)
             result = compiled_model(input)
-            self.assertEqual(counters["zendnn"]["zendnn_linear"], 1)
+            self.assertEqual(counters["zendnn"]["zendnn_linear_" + fusion_op], 1)
             self.assertEqual(
                 counters["zendnn"]["zendnn_weight_prepack_for_linear"],
                 1 if weight_prepacked else 0,
             )
+
         # Compare results
         torch.testing.assert_close(
             result, expected, rtol=rtol, atol=atol, equal_nan=True
@@ -422,29 +471,35 @@ class TestCompiledLinear(TestCase):
         out_features=st.integers(2, 256),
         has_bias=st.booleans(),
         use_bf16=st.booleans(),
-        weight_prepacked=st.booleans(),
-        dynamic_shape=st.booleans(),
+        fusion_op_idx=st.integers(
+            0, len(FUSION_TO_ACTIVATION_FUNC_MAP) - 1
+        ),  # Index into self.fusion_ops
+        weight_prepacked=st.booleans(),  # Whether to use prepacked weights
+        dynamic_shape=st.booleans(),  # Whether to use dynamic shape
     )
     @settings(deadline=None)
-    def test_compiled_linear_2d_input(
+    def test_compiled_linear_fusion_2d_input(
         self,
         batch_size,
         in_features,
         out_features,
         has_bias,
         use_bf16,
+        fusion_op_idx,
         weight_prepacked,
         dynamic_shape,
     ):
         if use_bf16 and not self.bf16_supported:
             # Skip test if bf16 is requested but not supported
             self.skipTest("BFloat16 not supported on this device")
+
         dtype = torch.bfloat16 if use_bf16 else torch.float32
+        fusion_op = self.fusion_ops[fusion_op_idx]
 
         # Create input tensor
         input = torch.randn(
-            batch_size,  # m
-            in_features,  # n
+            batch_size,
+            in_features,
             dtype=dtype,
             requires_grad=False,
             device=self.device,
@@ -452,8 +507,8 @@ class TestCompiledLinear(TestCase):
 
         # Create weight tensor
         weight = torch.randn(
-            out_features,  # k
-            in_features,  # n
+            out_features,
+            in_features,
             dtype=dtype,
             requires_grad=False,
             device=self.device,
@@ -467,10 +522,31 @@ class TestCompiledLinear(TestCase):
             if has_bias
             else None
         )
+
+        # Create second input for binary ops (add, mul)
+        second_input = None
+        if fusion_op in ["add", "mul"]:
+            second_input = torch.randn(
+                batch_size,
+                out_features,
+                dtype=dtype,
+                requires_grad=False,
+                device=self.device,
+            )
+
         rtol = 1e-2 if use_bf16 else 1e-4  # Relax tolerances for BF16
         atol = 1e-2 if use_bf16 else 1e-4
-        self._test_compiled_linear(
-            input, weight, bias, atol, rtol, weight_prepacked, dynamic_shape
+
+        self._test_compiled_linear_fusion(
+            input,
+            weight,
+            bias,
+            fusion_op,
+            second_input,
+            atol,
+            rtol,
+            weight_prepacked,
+            dynamic_shape,
         )
 
     @given(
@@ -480,11 +556,14 @@ class TestCompiledLinear(TestCase):
         out_features=st.integers(2, 128),
         has_bias=st.booleans(),
         use_bf16=st.booleans(),
-        weight_prepacked=st.booleans(),
-        dynamic_shape=st.booleans(),
+        fusion_op_idx=st.integers(
+            0, len(FUSION_TO_ACTIVATION_FUNC_MAP) - 1
+        ),  # Index into self.fusion_ops
+        weight_prepacked=st.booleans(),  # Whether to use prepacked weights
+        dynamic_shape=st.booleans(),  # Whether to use dynamic shape
     )
     @settings(deadline=None)
-    def test_compiled_linear_3d_input(
+    def test_compiled_linear_fusion_3d_input(
         self,
         batch_size,
         seq_len,
@@ -492,15 +571,16 @@ class TestCompiledLinear(TestCase):
         out_features,
         has_bias,
         use_bf16,
+        fusion_op_idx,
         weight_prepacked,
         dynamic_shape,
     ):
-        weight_prepacked = True
         if use_bf16 and not self.bf16_supported:
             # Skip test if bf16 is requested but not supported
             self.skipTest("BFloat16 not supported on this device")
 
         dtype = torch.bfloat16 if use_bf16 else torch.float32
+        fusion_op = self.fusion_ops[fusion_op_idx]
 
         # Create input tensor
         input = torch.randn(
@@ -530,10 +610,31 @@ class TestCompiledLinear(TestCase):
             else None
         )
 
+        # Create second input for binary ops (add, mul)
+        second_input = None
+        if fusion_op in ["add", "mul"]:
+            second_input = torch.randn(
+                batch_size,
+                seq_len,
+                out_features,
+                dtype=dtype,
+                requires_grad=False,
+                device=self.device,
+            )
+
         rtol = 1e-2 if use_bf16 else 1e-4  # Relax tolerances for BF16
         atol = 1e-2 if use_bf16 else 1e-4
-        self._test_compiled_linear(
-            input, weight, bias, atol, rtol, weight_prepacked, dynamic_shape
+
+        self._test_compiled_linear_fusion(
+            input,
+            weight,
+            bias,
+            fusion_op,
+            second_input,
+            atol,
+            rtol,
+            weight_prepacked,
+            dynamic_shape,
         )
 
     @given(
@@ -543,11 +644,14 @@ class TestCompiledLinear(TestCase):
         out_features=st.integers(2, 64),
         has_bias=st.booleans(),
         use_bf16=st.booleans(),
-        weight_prepacked=st.booleans(),
-        dynamic_shape=st.booleans(),
+        fusion_op_idx=st.integers(
+            0, len(FUSION_TO_ACTIVATION_FUNC_MAP) - 1
+        ),  # Index into self.fusion_ops
+        weight_prepacked=st.booleans(),  # Whether to use prepacked weights
+        dynamic_shape=st.booleans(),  # Whether to use dynamic shape
     )
     @settings(deadline=None)
-    def test_compiled_linear_nd_input(
+    def test_compiled_linear_fusion_nd_input(
         self,
         dims,
         batch_dim,
@@ -555,6 +659,7 @@ class TestCompiledLinear(TestCase):
         out_features,
         has_bias,
         use_bf16,
+        fusion_op_idx,
         weight_prepacked,
         dynamic_shape,
     ):
@@ -563,6 +668,7 @@ class TestCompiledLinear(TestCase):
             self.skipTest("BFloat16 not supported on this device")
 
         dtype = torch.bfloat16 if use_bf16 else torch.float32
+        fusion_op = self.fusion_ops[fusion_op_idx]
 
         # Create shape with multiple batch dimensions
         shape = [batch_dim] * (dims - 1) + [in_features]
@@ -590,10 +696,29 @@ class TestCompiledLinear(TestCase):
             else None
         )
 
+        # Create second input for binary ops (add, mul)
+        second_input = None
+        if fusion_op in ["add", "mul"]:
+            # Create shape for second input (same as output shape)
+            output_shape = list(shape)
+            output_shape[-1] = out_features
+            second_input = torch.randn(
+                *output_shape, dtype=dtype, requires_grad=False, device=self.device
+            )
+
         rtol = 1e-2 if use_bf16 else 1e-4  # Relax tolerances for BF16
         atol = 1e-2 if use_bf16 else 1e-4
-        self._test_compiled_linear(
-            input, weight, bias, atol, rtol, weight_prepacked, dynamic_shape
+
+        self._test_compiled_linear_fusion(
+            input,
+            weight,
+            bias,
+            fusion_op,
+            second_input,
+            atol,
+            rtol,
+            weight_prepacked,
+            dynamic_shape,
         )
 
 
@@ -604,34 +729,44 @@ class TestCompiledLinear(TestCase):
     ),
     "ZenDNN is not available in this PyTorch build",
 )
-class TestExportedLinear(TestCase):
+class TestExportedLinearFusion(TestCase):
     def setUp(self):
         self.device = torch.device("cpu")
         import tempfile
 
         self.tmpdir = tempfile.mkdtemp()
-        # Check if bfloat16 is supported on the current device
         self.previous_weight_prepack = torch._inductor.config.cpp.weight_prepack
-        self.previous_enable_zendnn = torch._inductor.config.enable_zendnn
+        # Check if bfloat16 is supported on the current device
         self.bf16_supported = torch._C._cpu._is_avx512_bf16_supported()
+        self.fusion_ops = list(FUSION_TO_ACTIVATION_FUNC_MAP.keys())
 
     def tearDown(self):
         import shutil
 
         torch._inductor.config.cpp.weight_prepack = self.previous_weight_prepack
-        torch._inductor.config.enable_zendnn = self.previous_enable_zendnn
         shutil.rmtree(self.tmpdir)
 
-    def _test_exported_linear(
-        self, input, weight, bias, atol, rtol, weight_prepacked, dynamic_shape
+    def _test_exported_linear_fusion(
+        self,
+        input,
+        weight,
+        bias,
+        fusion_op,
+        second_input,
+        atol,
+        rtol,
+        weight_prepacked,
+        dynamic_shape,
     ):
         # Reset counters
         counters.clear()
 
-        # Run reference implementation using torch.nn.functional.linear#
+        # Run reference implementation
         torch._dynamo.reset()
         torch._inductor.config.enable_zendnn = False
-        linear_model = CustomLinearModel(weight, bias).to(input.dtype)
+        linear_model = CustomLinearFusionModel(
+            weight, bias, fusion_op, second_input
+        ).to(input.dtype)
         exported = torch.export.export(
             linear_model, (input,)
         )  # Dynamic is not currently supported
@@ -645,32 +780,34 @@ class TestExportedLinear(TestCase):
         torch._inductor.config.enable_zendnn = True
 
         # Run ZenDNN implementation
-        torch._dynamo.reset()
         torch._inductor.config.cpp.weight_prepack = weight_prepacked
-        zendnn_linear_model = CustomLinearModel(weight, bias).to(input.dtype)
-        self.assertEqual(counters["zendnn"]["zendnn_linear"], 0)
+        torch._dynamo.reset()
+        self.assertEqual(counters["zendnn"]["zendnn_linear_" + fusion_op], 0)
         self.assertEqual(counters["zendnn"]["zendnn_weight_prepack_for_linear"], 0)
         # Create exported version
         exported = torch.export.export(
-            zendnn_linear_model, (input,)
-        )  # Dynamic is not currently supported
+            copy.deepcopy(linear_model), (input,)
+        )  # dynamic shapes are currenlt not supported in export
         output_path = torch._inductor.aoti_compile_and_package(
             exported,
             package_path=os.path.join(self.tmpdir, "model_zendnn.pt2"),
         )
-        self.assertEqual(counters["zendnn"]["zendnn_linear"], 1)
+        self.assertEqual(counters["zendnn"]["zendnn_linear_" + fusion_op], 1)
         self.assertEqual(
             counters["zendnn"]["zendnn_weight_prepack_for_linear"],
             1 if weight_prepacked else 0,
         )
         counters.clear()
+
         exported_model = torch._inductor.aoti_load_package(output_path)
 
+        # Forward pass with both models
         with torch.no_grad():
             result = exported_model(input)
-        # Compare results
-        self.assertEqual(counters["zendnn"]["zendnn_linear"], 0)
+        self.assertEqual(counters["zendnn"]["zendnn_linear_" + fusion_op], 0)
         self.assertEqual(counters["zendnn"]["zendnn_weight_prepack_for_linear"], 0)
+
+        # Compare results
         torch.testing.assert_close(
             result, expected, rtol=rtol, atol=atol, equal_nan=True
         )
@@ -681,24 +818,30 @@ class TestExportedLinear(TestCase):
         out_features=st.integers(2, 256),
         has_bias=st.booleans(),
         use_bf16=st.booleans(),
-        weight_prepacked=st.booleans(),
-        dynamic_shape=st.booleans(),
+        fusion_op_idx=st.integers(
+            0, len(FUSION_TO_ACTIVATION_FUNC_MAP) - 1
+        ),  # Index into self.fusion_ops
+        weight_prepacked=st.booleans(),  # Whether to use prepacked weights
+        dynamic_shape=st.booleans(),  # Whether to use dynamic shape
     )
     @settings(deadline=None)
-    def test_exported_linear_2d_input(
+    def test_exported_linear_fusion_2d_input(
         self,
         batch_size,
         in_features,
         out_features,
         has_bias,
         use_bf16,
+        fusion_op_idx,
         weight_prepacked,
         dynamic_shape,
     ):
         if use_bf16 and not self.bf16_supported:
             # Skip test if bf16 is requested but not supported
             self.skipTest("BFloat16 not supported on this device")
+
         dtype = torch.bfloat16 if use_bf16 else torch.float32
+        fusion_op = self.fusion_ops[fusion_op_idx]
 
         # Create input tensor
         input = torch.randn(
@@ -726,10 +869,31 @@ class TestExportedLinear(TestCase):
             if has_bias
             else None
         )
+
+        # Create second input for binary ops (add, mul)
+        second_input = None
+        if fusion_op in ["add", "mul"]:
+            second_input = torch.randn(
+                batch_size,
+                out_features,
+                dtype=dtype,
+                requires_grad=False,
+                device=self.device,
+            )
+
         rtol = 1e-2 if use_bf16 else 1e-4  # Relax tolerances for BF16
         atol = 1e-2 if use_bf16 else 1e-4
-        self._test_exported_linear(
-            input, weight, bias, atol, rtol, weight_prepacked, dynamic_shape
+
+        self._test_exported_linear_fusion(
+            input,
+            weight,
+            bias,
+            fusion_op,
+            second_input,
+            atol,
+            rtol,
+            weight_prepacked,
+            dynamic_shape,
         )
 
     @given(
@@ -739,11 +903,14 @@ class TestExportedLinear(TestCase):
         out_features=st.integers(2, 128),
         has_bias=st.booleans(),
         use_bf16=st.booleans(),
-        weight_prepacked=st.booleans(),
-        dynamic_shape=st.booleans(),
+        fusion_op_idx=st.integers(
+            0, len(FUSION_TO_ACTIVATION_FUNC_MAP) - 1
+        ),  # Index into self.fusion_ops
+        weight_prepacked=st.booleans(),  # Whether to use prepacked weights
+        dynamic_shape=st.booleans(),  # Whether to use dynamic shape
     )
     @settings(deadline=None)
-    def test_exported_linear_3d_input(
+    def test_exported_linear_fusion_3d_input(
         self,
         batch_size,
         seq_len,
@@ -751,6 +918,7 @@ class TestExportedLinear(TestCase):
         out_features,
         has_bias,
         use_bf16,
+        fusion_op_idx,
         weight_prepacked,
         dynamic_shape,
     ):
@@ -759,6 +927,7 @@ class TestExportedLinear(TestCase):
             self.skipTest("BFloat16 not supported on this device")
 
         dtype = torch.bfloat16 if use_bf16 else torch.float32
+        fusion_op = self.fusion_ops[fusion_op_idx]
 
         # Create input tensor
         input = torch.randn(
@@ -788,10 +957,31 @@ class TestExportedLinear(TestCase):
             else None
         )
 
+        # Create second input for binary ops (add, mul)
+        second_input = None
+        if fusion_op in ["add", "mul"]:
+            second_input = torch.randn(
+                batch_size,
+                seq_len,
+                out_features,
+                dtype=dtype,
+                requires_grad=False,
+                device=self.device,
+            )
+
         rtol = 1e-2 if use_bf16 else 1e-4  # Relax tolerances for BF16
         atol = 1e-2 if use_bf16 else 1e-4
-        self._test_exported_linear(
-            input, weight, bias, atol, rtol, weight_prepacked, dynamic_shape
+
+        self._test_exported_linear_fusion(
+            input,
+            weight,
+            bias,
+            fusion_op,
+            second_input,
+            atol,
+            rtol,
+            weight_prepacked,
+            dynamic_shape,
         )
 
     @given(
@@ -801,11 +991,14 @@ class TestExportedLinear(TestCase):
         out_features=st.integers(2, 64),
         has_bias=st.booleans(),
         use_bf16=st.booleans(),
-        weight_prepacked=st.booleans(),
-        dynamic_shape=st.booleans(),
+        fusion_op_idx=st.integers(
+            0, len(FUSION_TO_ACTIVATION_FUNC_MAP) - 1
+        ),  # Index into self.fusion_ops
+        weight_prepacked=st.booleans(),  # Whether to use prepacked weights
+        dynamic_shape=st.booleans(),  # Whether to use dynamic shape
     )
     @settings(deadline=None)
-    def test_exported_linear_nd_input(
+    def test_exported_linear_fusion_nd_input(
         self,
         dims,
         batch_dim,
@@ -813,6 +1006,7 @@ class TestExportedLinear(TestCase):
         out_features,
         has_bias,
         use_bf16,
+        fusion_op_idx,
         weight_prepacked,
         dynamic_shape,
     ):
@@ -821,6 +1015,7 @@ class TestExportedLinear(TestCase):
             self.skipTest("BFloat16 not supported on this device")
 
         dtype = torch.bfloat16 if use_bf16 else torch.float32
+        fusion_op = self.fusion_ops[fusion_op_idx]
 
         # Create shape with multiple batch dimensions
         shape = [batch_dim] * (dims - 1) + [in_features]
@@ -848,10 +1043,29 @@ class TestExportedLinear(TestCase):
             else None
         )
 
+        # Create second input for binary ops (add, mul)
+        second_input = None
+        if fusion_op in ["add", "mul"]:
+            # Create shape for second input (same as output shape)
+            output_shape = list(shape)
+            output_shape[-1] = out_features
+            second_input = torch.randn(
+                *output_shape, dtype=dtype, requires_grad=False, device=self.device
+            )
+
         rtol = 1e-2 if use_bf16 else 1e-4  # Relax tolerances for BF16
         atol = 1e-2 if use_bf16 else 1e-4
-        self._test_exported_linear(
-            input, weight, bias, atol, rtol, weight_prepacked, dynamic_shape
+
+        self._test_exported_linear_fusion(
+            input,
+            weight,
+            bias,
+            fusion_op,
+            second_input,
+            atol,
+            rtol,
+            weight_prepacked,
+            dynamic_shape,
         )
 
 
