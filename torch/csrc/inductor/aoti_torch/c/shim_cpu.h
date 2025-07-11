@@ -253,6 +253,17 @@ AOTI_TORCH_EXPORT AOTITorchError aoti_torch_cpu__zendnn_weight_prepack_for_linea
     const char* name,
     AtenTensorHandle* ret0);
 
+AOTI_TORCH_EXPORT AOTITorchError aoti_torch_cpu__zendnn_linear_unary_binary(
+    AtenTensorHandle X,
+    AtenTensorHandle W,
+    AtenTensorHandle BInput,
+    AtenTensorHandle* B,
+    bool is_weight_prepacked,
+    const char* post_op_1,
+    const char* post_op_2,
+    const char* name,
+    AtenTensorHandle* ret0);
+
 #endif // AT_ZENDNN_ENABLED()
 
 AOTI_TORCH_EXPORT AOTITorchError aoti_torch_cpu__weight_int4pack_mm_cpu_tensor(

@@ -563,6 +563,31 @@ AOTITorchError aoti_torch_cpu__zendnn_weight_prepack_for_linear(
   });
 }
 
+AOTITorchError aoti_torch_cpu__zendnn_linear_unary_binary(
+    AtenTensorHandle X,
+    AtenTensorHandle W,
+    AtenTensorHandle BInput,
+    AtenTensorHandle* B,
+    bool is_weight_prepacked,
+    const char* post_op_1,
+    const char* post_op_2,
+    const char* name,
+    AtenTensorHandle* ret0) {
+  AOTI_TORCH_CONVERT_EXCEPTION_TO_ERROR_CODE({
+    // Note: B is optional, so we use pointer_to_optional to handle it.
+    auto tmp_result = at::native::zendnn_linear_unary_binary(
+        *tensor_handle_to_tensor_pointer(X),
+        *tensor_handle_to_tensor_pointer(W),
+        *tensor_handle_to_tensor_pointer(BInput),
+        pointer_to_optional<at::Tensor>(B),
+        is_weight_prepacked,
+        std::string(post_op_1),
+        std::string(post_op_2),
+        std::string(name));
+    *ret0 = new_tensor_handle(std::move(tmp_result));
+  });
+}
+
 #endif // AT_ZENDNN_ENABLED()
 
 AOTITorchError aoti_torch_cpu__weight_int4pack_mm_cpu_tensor(
