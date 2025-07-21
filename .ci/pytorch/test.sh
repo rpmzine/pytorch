@@ -1558,7 +1558,7 @@ test_linux_aarch64() {
         test_transformers test_multiprocessing test_numpy_interop test_autograd test_binary_ufuncs test_complex test_spectral_ops \
         test_foreach test_reductions test_unary_ufuncs test_tensor_creation_ops test_ops test_cpp_extensions_open_device_registration \
         profiler/test_memory_profiler \
-	--shard "$SHARD_NUMBER" "$NUM_TEST_SHARDS" --verbose
+        --shard "$SHARD_NUMBER" "$NUM_TEST_SHARDS" --verbose
 
   # Dynamo tests
   python test/run_test.py --include dynamo/test_compile dynamo/test_backends dynamo/test_comptime dynamo/test_config \
