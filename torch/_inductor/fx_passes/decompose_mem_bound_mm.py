@@ -4,7 +4,7 @@ import logging
 import torch
 from torch import Tensor
 from torch._dynamo.utils import counters, is_node_meta_valid
-from torch.fx.experimental.symbolic_shapes import statically_known_true
+from torch.fx.experimental.symbolic_shapes import statically_known_false, statically_known_true
 
 from .. import config
 from ..pattern_matcher import Arg, CallFunction, Match, register_graph_pattern
@@ -89,23 +89,58 @@ def should_decompose_mm(mat1, mat2) -> bool:
         return False
     if len(mat1.shape) != 2 or len(mat2.shape) != 2:
         return False
-    return (
-        check_device(mat1, mat2, device="cuda")
-        and statically_known_true(mat1.shape[0] >= min_first_dimension_decomposition)
-        and statically_known_true(mat2.shape[0] < max_other_dimension_decomposition)
-        and statically_known_true(mat2.shape[1] < max_other_dimension_decomposition)
-    ) or (
-        check_device(mat1, mat2, device="cpu")
-        and statically_known_true(
-            mat1.shape[0] <= cpu_max_first_dimension_decomposition
+    # case 1: we skip decompose mm if the input is dynamic shape
+    if config.post_grad_fusion_options["decompose_mm_pass"].get(
+        "decompose_dynamic_shape", False
+    ):
+        return (
+            check_device(mat1, mat2, device="cuda")
+            and statically_known_true(mat1.shape[0] >= min_first_dimension_decomposition)
+            and statically_known_true(mat2.shape[0] < max_other_dimension_decomposition)
+            and statically_known_true(mat2.shape[1] < max_other_dimension_decomposition)
+        ) or (
+            check_device(mat1, mat2, device="cpu")
+            and statically_known_true(
+                mat1.shape[0] <= cpu_max_first_dimension_decomposition
+            )
+            and statically_known_true(
+                mat2.shape[0] <= cpu_max_other_dimension_decomposition
+            )
+            and statically_known_true(
+                mat2.shape[1] <= cpu_max_other_dimension_decomposition
+            )
         )
-        and statically_known_true(
-            mat2.shape[0] <= cpu_max_other_dimension_decomposition
+    # case 2: we decompose mm if the input is dynamic shape
+    else:
+        return (
+            check_device(mat1, mat2, device="cuda")
+            and (
+                statically_known_true(mat1.shape[0] >= min_first_dimension_decomposition)
+                or not statically_known_false(mat1.shape[0] >= min_first_dimension_decomposition)
+            )
+            and (
+                statically_known_true(mat2.shape[0] < max_other_dimension_decomposition)
+                or not statically_known_false(mat2.shape[0] < max_other_dimension_decomposition)
+            )
+            and (
+                statically_known_true(mat2.shape[1] < max_other_dimension_decomposition)
+                or not statically_known_false(mat2.shape[1] < max_other_dimension_decomposition)
+            )
+        ) or (
+            check_device(mat1, mat2, device="cpu")
+            and (
+                statically_known_true(mat1.shape[0] <= cpu_max_first_dimension_decomposition)
+                or not statically_known_false(mat1.shape[0] <= cpu_max_first_dimension_decomposition)
+            )
+            and (
+                statically_known_true(mat2.shape[0] <= cpu_max_other_dimension_decomposition)
+                or not statically_known_false(mat2.shape[0] <= cpu_max_other_dimension_decomposition)
+            )
+            and (
+                statically_known_true(mat2.shape[1] <= cpu_max_other_dimension_decomposition)
+                or not statically_known_false(mat2.shape[1] <= cpu_max_other_dimension_decomposition)
+            )
         )
-        and statically_known_true(
-            mat2.shape[1] <= cpu_max_other_dimension_decomposition
-        )
-    )
 
 
 def print_decompose_pattern(match: Match, inputs: list[torch.fx.Node]):

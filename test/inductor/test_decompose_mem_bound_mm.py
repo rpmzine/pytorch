@@ -340,10 +340,9 @@ class TestDecomposeMemMM(TestCase):
             )
             counters.clear()
 
-    @unittest.skip
-    @parametrize("m,k,n, should_decompose", [(20480, 5, 2, True)])
+    @parametrize("m,k,n", [(20480, 5, 2)])
     @parametrize("has_bias", [True, False])
-    def test_dynamic_shape(self, m, n, k, has_bias, should_decompose):
+    def test_dynamic_shape(self, m, n, k, has_bias):
         torch._logging.set_logs(inductor=logging.DEBUG)
         input = torch.randn(m, k, device=GPU_TYPE).requires_grad_(True)
 
@@ -357,7 +356,7 @@ class TestDecomposeMemMM(TestCase):
 
         self.compare_pred(module, traced, input)
 
-        expected_val = 1 if should_decompose and HAS_CUDA else 0
+        expected_val = 1 if HAS_CUDA else 0
         if has_bias:
             self.assertEqual(
                 counters["inductor"]["decompose_addmm"],
