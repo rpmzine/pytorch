@@ -282,7 +282,7 @@ class TestCKBackend(TestCase):
 
     @unittest.skipIf(not torch.version.hip, "ROCM only")
     @unittest.skipIf(
-        not PLATFORM_SUPPORTS_BF16 and not PLATFORM_SUPPORTS_FP8,
+        not PLATFORM_SUPPORTS_BF16 or not PLATFORM_SUPPORTS_FP8,
         "Scaled mm requires bf16 and fp8 support",
     )
     @unittest.mock.patch.dict(os.environ, {"PATH": _get_path_without_sccache()})
