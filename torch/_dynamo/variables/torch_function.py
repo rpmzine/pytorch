@@ -195,14 +195,14 @@ def populate_builtin_to_tensor_fn_map():
 # in that case, when we try to initialize dynamo module, we
 # get a circular import because this map - see:
 # https://github.com/pytorch/pytorch/issues/158120 for more details
-_builtin_map_populated = True
+_builtin_to_tensor_fn_map_populated = False
 
 
-def _ensure_builtin_map_populated():
-    global _builtin_map_populated
-    if not _builtin_map_populated:
+def _ensure_builtin_to_tensor_fn_map_populated():
+    global _builtin_to_tensor_fn_map_populated
+    if not _builtin_to_tensor_fn_map_populated:
         populate_builtin_to_tensor_fn_map()
-        _builtin_map_populated = True
+        _builtin_to_tensor_fn_map_populated = True
 
 
 banned_attrs = [
