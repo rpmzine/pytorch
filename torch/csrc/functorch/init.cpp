@@ -8,6 +8,8 @@
 #include <ATen/WrapDimUtils.h>
 #include <torch/csrc/functorch/init.h>
 #include <torch/csrc/utils/python_raii.h>
+#include <torch/csrc/utils/disable_torch_function.h>
+#include <torch/csrc/utils/python_arg_parser.h>
 #include <torch/python.h>
 
 #include <ATen/functorch/BatchRulesHelper.h>
@@ -40,7 +42,8 @@ static Tensor _add_batch_dim(
     const Tensor& self,
     int64_t batch_dim,
     int64_t level) {
-  return addBatchDim(self, batch_dim, level);
+    return addBatchDim(self, batch_dim, level);
+
 }
 
 static Tensor _wrap_functional_tensor(const Tensor& self, int64_t level) {
